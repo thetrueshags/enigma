@@ -1,0 +1,15 @@
+[package]
+name = "enigma-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axion-core = { workspace = true }
+axion-crypto = { workspace = true }
+aes-gcm = { workspace = true }
+pqcrypto-kyber = { workspace = true }
+pqcrypto-traits = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+anyhow = { workspace = true }
