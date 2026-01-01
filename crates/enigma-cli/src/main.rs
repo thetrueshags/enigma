@@ -12,34 +12,62 @@ use std::time::Duration;
 #[command(
     name = "enigma",
     version = "1.0",
-    about = "Quantum-Safe Double-Lock Vault"
+    about = "Axion Layer 2: Quantum-Safe Vault"
 )]
 struct Cli {
+    /// URL of the Axion Node to connect to
+    #[arg(long, default_value = "http://127.0.0.1:3030")]
+    rpc: String,
+
+    /// Path to identity file (defaults to system config)
+    #[arg(long, short = 'k')]
+    keyfile: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Encrypt and upload a new secret
     Add,
+    /// List and decrypt all secrets from the mesh
     List,
+    /// Announce identity to the network (required once)
+    Sync,
 }
-
-const AXION_RPC: &str = "http://127.0.0.1:3030";
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let id = identity::load_or_create("identity.json")?;
-    println!("👤 DID: {}\n", style(&id.did).cyan());
+    // 1. Load Identity
+    let (id, key_path) = identity::load_or_create(cli.keyfile)?;
+    println!(
+        "🔑 Identity loaded from: {}",
+        style(key_path.to_string_lossy()).dim()
+    );
+    println!("👤 DID: {}\n", style(&id.did).cyan().bold());
 
-    ensure_identity_registered(&id).await?;
+    // 2. Check Connection
+    let client = reqwest::Client::new();
+    if client.get(&cli.rpc).send().await.is_err() {
+        println!(
+            "❌ {} Could not connect to Axion Node at {}",
+            style("ERROR:").red(),
+            cli.rpc
+        );
+        println!("   Ensure the node is running or specify a remote node with --rpc");
+        return Ok(());
+    }
 
     match cli.command {
+        Commands::Sync => {
+            ensure_identity_registered(&client, &cli.rpc, &id).await?;
+        }
         Commands::Add => {
             let title: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Title (e.g. GitHub)")
+                .with_prompt("Title")
                 .interact_text()?;
             let user: String = Input::with_theme(&ColorfulTheme::default())
                 .with_prompt("Username")
@@ -47,56 +75,62 @@ async fn main() -> Result<()> {
             let pass = Password::with_theme(&ColorfulTheme::default())
                 .with_prompt("Password")
                 .interact()?;
+            let notes: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("Notes")
+                .allow_empty(true)
+                .interact_text()?;
 
-            let record = SecretRecord::new(title, &user, &pass, "Axion Double-Locked");
+            println!("🔒 Encrypting...");
 
-            println!("🔒 Applying Enigma Encryption (Layer 1)...");
+            // Layer 1: Enigma (Client-Side)
+            let record = SecretRecord::new(title, &user, &pass, &notes);
             let inner_payload = EnigmaPayload::encrypt(&record, &id.encryption.public)?;
+            let inner_bytes = bincode::serialize(&inner_payload)?;
 
-            let inner_bytes = bincode::serialize(&inner_payload)
-                .map_err(|e| anyhow!("Failed to serialize Enigma payload: {}", e))?;
-
-            let raw_did = id.did.replace("did:axion:", "");
+            // Layer 2: Axion (Transport)
+            // FIX: Do NOT strip the "did:axion:" prefix. The node needs the full DID to look up keys.
             let body = json!({
                 "type": "private",
-                "recipient": raw_did,
+                "recipient": id.did,
                 "data": hex::encode(inner_bytes)
             });
 
-            let client = reqwest::Client::new();
             let res = client
-                .post(format!("{}/publish", AXION_RPC))
+                .post(format!("{}/publish", cli.rpc))
                 .json(&body)
                 .send()
                 .await?;
-
-            let status = res.status();
             let response_text = res.text().await?;
 
-            if status.is_success() && !response_text.contains("Error") {
-                println!("✅ Published to Mesh!");
-                println!("📦 Block Hash: {}", style(response_text).green());
+            // Check if the response body contains an error message (even if HTTP status is 200)
+            if response_text.contains("Error") {
+                println!("❌ Upload Failed: {}", style(response_text).red());
+                println!("   (Tip: Have you run 'enigma sync' to register your identity?)");
             } else {
-                println!("❌ Node Rejected Block: {}", style(response_text).red());
+                println!("✅ Secret Uploaded! Hash: {}", style(response_text).green());
             }
         }
         Commands::List => {
-            println!(
-                "📂 Fetching vault index for DID: {}...",
-                style(&id.did).cyan()
-            );
-            let client = reqwest::Client::new();
+            println!("📥 Querying public mesh for relevant data...");
+
             let res = client
-                .get(format!("{}/api/vault/{}", AXION_RPC, id.did))
+                .get(format!("{}/api/blocks", cli.rpc))
+                .query(&[("recipient", &id.did), ("limit", &"100".to_string())])
                 .send()
                 .await?;
 
             if !res.status().is_success() {
-                return Err(anyhow!("Failed to retrieve vault: {}", res.status()));
+                println!("❌ Failed to query mesh. Status: {}", res.status());
+                return Ok(());
             }
 
             let blocks: Vec<axion_core::AxionBlock> = res.json().await?;
-            println!("Found {} encrypted records.\n", blocks.len());
+            if blocks.is_empty() {
+                println!("📭 No records found in recent history.");
+                return Ok(());
+            }
+
+            println!("🔓 Decrypting {} relevant blocks...\n", blocks.len());
 
             for block in blocks {
                 if let axion_core::BlockPayload::DataStore { blob, .. } = &block.payload {
@@ -111,66 +145,50 @@ async fn main() -> Result<()> {
                             &nonce,
                             &id.encryption.secret,
                         ) {
-                            Ok(inner_bytes) => {
-                                match EnigmaPayload::decrypt(&inner_bytes, &id.encryption.secret) {
+                            Ok(enigma_bytes) => {
+                                match EnigmaPayload::decrypt(&enigma_bytes, &id.encryption.secret) {
                                     Ok(record) => {
-                                        println!(
-                                            "🔹 [{}] - {} (User: {})",
-                                            style(&block.hash[..8]).yellow(),
-                                            style(record.title).bold().green(),
-                                            record.username
-                                        );
+                                        println!("🔹 {}", style(&record.title).bold().green());
+                                        println!("   User: {}", record.username);
+                                        println!("   Pass: {}", style(record.password).dim());
+                                        println!("   Note: {}\n", style(record.notes).italic());
                                     }
-                                    Err(e) => {
-                                        println!("❌ Inner Decrypt Failed: {}", style(e).red());
-                                    }
+                                    Err(_) => println!(
+                                        "⚠️  Corrupt Enigma Payload in Block {}",
+                                        &block.hash[..8]
+                                    ),
                                 }
                             }
-                            Err(e) => {
-                                println!("❌ Outer Decrypt Failed: {}", style(e).red());
-                            }
+                            Err(_) => println!(
+                                "⚠️  Failed to unwrap Axion Transport Layer for {}",
+                                &block.hash[..8]
+                            ),
                         }
-                    } else {
-                        println!(
-                            "⚠️  [{}] - No access keys found for your DID",
-                            style(&block.hash[..8]).red()
-                        );
                     }
                 }
             }
         }
     }
+
     Ok(())
 }
 
-async fn ensure_identity_registered(id: &identity::PersistentIdentity) -> Result<()> {
-    let client = reqwest::Client::new();
-    let body = json!({
-        "did": id.did,
-        "encryption_key": hex::encode(&id.encryption.public)
-    });
-
+async fn ensure_identity_registered(
+    client: &reqwest::Client,
+    rpc: &str,
+    id: &identity::PersistentIdentity,
+) -> Result<()> {
+    let body = json!({ "did": id.did, "encryption_key": hex::encode(&id.encryption.public) });
     let res = client
-        .post(format!("{}/announce_key", AXION_RPC))
+        .post(format!("{}/announce_key", rpc))
         .json(&body)
         .send()
-        .await;
+        .await?;
 
-    match res {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                println!("📡 Identity synced with local mesh. Waiting for confirmation...");
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-            } else {
-                println!("⚠️  Node Announcement Warning: {}", resp.status());
-            }
-        }
-        Err(_) => {
-            return Err(anyhow!(
-                "Could not connect to Axion Node at {}. Is it running?",
-                AXION_RPC
-            ));
-        }
+    if res.status().is_success() {
+        println!("✅ Identity Announced to Network.");
+    } else {
+        println!("⚠️  Announcement failed: {}", res.status());
     }
     Ok(())
 }
