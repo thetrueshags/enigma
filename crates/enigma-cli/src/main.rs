@@ -1,17 +1,20 @@
 mod identity;
+mod network;
+mod ui;
+mod vault;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use console::style;
-use dialoguer::{theme::ColorfulTheme, Input, Password};
+use dialoguer::{theme::ColorfulTheme, Input, Password, Select};
 use enigma_core::{models::SecretRecord, EnigmaPayload};
 use serde_json::json;
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(
     name = "enigma",
-    version = "1.0",
+    version = "1.1",
     about = "Axion Layer 2: Quantum-Safe Vault"
 )]
 struct Cli {
@@ -29,12 +32,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Encrypt and upload a new secret
+    /// Encrypt and upload a new secret to the mesh
     Add,
-    /// List and decrypt all secrets from the mesh
-    List,
-    /// Announce identity to the network (required once)
+    /// Search the mesh and copy a password to clipboard
+    Get {
+        /// Search query (matches title, URL, username)
+        query: String,
+    },
+    /// List all secrets from local cache
+    List {
+        /// Refresh from the network before listing
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Register identity + pull all secrets from the mesh into local cache
     Sync,
+    /// Open the vault UI in your browser
+    Ui {
+        /// Port for the local UI server
+        #[arg(long, default_value = "8420")]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -49,25 +67,55 @@ async fn main() -> Result<()> {
     );
     println!("👤 DID: {}\n", style(&id.did).cyan().bold());
 
-    // 2. Check Connection
+    let vp = vault::vault_path(&key_path);
+
+    // 2. For UI mode, skip connection check and go straight to serve
+    if let Commands::Ui { port } = cli.command {
+        return ui::serve(id, vp, cli.rpc, port).await;
+    }
+
+    // 3. Check Connection (except for offline-capable commands)
     let client = reqwest::Client::new();
-    if client.get(&cli.rpc).send().await.is_err() {
-        println!(
+    let needs_network = !matches!(&cli.command, Commands::List { refresh: false });
+
+    if needs_network && client.get(&cli.rpc).send().await.is_err() {
+        eprintln!(
             "❌ {} Could not connect to Axion Node at {}",
             style("ERROR:").red(),
             cli.rpc
         );
-        println!("   Ensure the node is running or specify a remote node with --rpc");
-        return Ok(());
+        eprintln!("   Ensure the node is running or specify a remote node with --rpc");
+        if !matches!(&cli.command, Commands::List { .. }) {
+            return Ok(());
+        }
     }
 
     match cli.command {
         Commands::Sync => {
-            ensure_identity_registered(&client, &cli.rpc, &id).await?;
+            println!("📡 Announcing encryption key...");
+            let res = client
+                .post(format!("{}/announce_key", cli.rpc))
+                .send()
+                .await?;
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            if body.get("error").is_some() {
+                eprintln!("❌ Announcement failed: {}", body["error"]);
+                return Ok(());
+            }
+            println!("✅ Key announced.\n");
+
+            println!("📥 Pulling secrets from the mesh...");
+            let synced = network::sync_from_network(&client, &cli.rpc, &id, &vp).await?;
+            println!("✅ Synced {} secret(s) into local vault.", synced);
         }
+
         Commands::Add => {
             let title: String = Input::with_theme(&ColorfulTheme::default())
                 .with_prompt("Title")
+                .interact_text()?;
+            let url: String = Input::with_theme(&ColorfulTheme::default())
+                .with_prompt("URL (optional)")
+                .allow_empty(true)
                 .interact_text()?;
             let user: String = Input::with_theme(&ColorfulTheme::default())
                 .with_prompt("Username")
@@ -76,21 +124,18 @@ async fn main() -> Result<()> {
                 .with_prompt("Password")
                 .interact()?;
             let notes: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Notes")
+                .with_prompt("Notes (optional)")
                 .allow_empty(true)
                 .interact_text()?;
 
             println!("🔒 Encrypting...");
 
-            // Layer 1: Enigma (Client-Side)
-            let record = SecretRecord::new(title, &user, &pass, &notes);
+            let record = SecretRecord::new(title, &user, &pass, &notes, &url);
+
             let inner_payload = EnigmaPayload::encrypt(&record, &id.encryption.public)?;
             let inner_bytes = bincode::serialize(&inner_payload)?;
 
-            // Layer 2: Axion (Transport)
-            // FIX: Do NOT strip the "did:axion:" prefix. The node needs the full DID to look up keys.
             let body = json!({
-                "type": "private",
                 "recipient": id.did,
                 "data": hex::encode(inner_bytes)
             });
@@ -100,95 +145,136 @@ async fn main() -> Result<()> {
                 .json(&body)
                 .send()
                 .await?;
-            let response_text = res.text().await?;
 
-            // Check if the response body contains an error message (even if HTTP status is 200)
-            if response_text.contains("Error") {
-                println!("❌ Upload Failed: {}", style(response_text).red());
-                println!("   (Tip: Have you run 'enigma sync' to register your identity?)");
+            let resp: serde_json::Value = res.json().await.unwrap_or_default();
+            if let Some(err) = resp.get("error") {
+                eprintln!("❌ Upload failed: {}", err);
+                eprintln!("   (Tip: Have you run 'enigma sync' to register your identity?)");
             } else {
-                println!("✅ Secret Uploaded! Hash: {}", style(response_text).green());
+                println!("✅ Secret stored on the mesh.");
+                let mut vault_data = vault::load(&vp, &id.signing.secret)?;
+                vault::upsert(&mut vault_data, record);
+                vault::save(&vp, &id.signing.secret, &vault_data)?;
             }
         }
-        Commands::List => {
-            println!("📥 Querying public mesh for relevant data...");
 
-            let res = client
-                .get(format!("{}/api/blocks", cli.rpc))
-                .query(&[("recipient", &id.did), ("limit", &"100".to_string())])
-                .send()
-                .await?;
+        Commands::Get { query } => {
+            println!("🔍 Searching the mesh for '{}'...\n", &query);
 
-            if !res.status().is_success() {
-                println!("❌ Failed to query mesh. Status: {}", res.status());
-                return Ok(());
-            }
+            let records = network::fetch_and_decrypt(&client, &cli.rpc, &id).await?;
 
-            let blocks: Vec<axion_core::AxionBlock> = res.json().await?;
-            if blocks.is_empty() {
-                println!("📭 No records found in recent history.");
-                return Ok(());
-            }
-
-            println!("🔓 Decrypting {} relevant blocks...\n", blocks.len());
-
-            for block in blocks {
-                if let axion_core::BlockPayload::DataStore { blob, .. } = &block.payload {
-                    if blob.is_empty() {
-                        continue;
-                    }
-
-                    if let Ok((kem, nonce)) = block.payload.get_keys_for(&id.did) {
-                        match axion_crypto::hybrid_decrypt(
-                            blob,
-                            &kem,
-                            &nonce,
-                            &id.encryption.secret,
-                        ) {
-                            Ok(enigma_bytes) => {
-                                match EnigmaPayload::decrypt(&enigma_bytes, &id.encryption.secret) {
-                                    Ok(record) => {
-                                        println!("🔹 {}", style(&record.title).bold().green());
-                                        println!("   User: {}", record.username);
-                                        println!("   Pass: {}", style(record.password).dim());
-                                        println!("   Note: {}\n", style(record.notes).italic());
-                                    }
-                                    Err(_) => println!(
-                                        "⚠️  Corrupt Enigma Payload in Block {}",
-                                        &block.hash[..8]
-                                    ),
-                                }
-                            }
-                            Err(_) => println!(
-                                "⚠️  Failed to unwrap Axion Transport Layer for {}",
-                                &block.hash[..8]
-                            ),
-                        }
-                    }
+            // Update local cache
+            if !records.is_empty() {
+                let mut vault_data = vault::load(&vp, &id.signing.secret)?;
+                for r in &records {
+                    vault::upsert(&mut vault_data, r.clone());
                 }
+                vault_data.last_sync = Some(now_secs());
+                vault::save(&vp, &id.signing.secret, &vault_data)?;
+            }
+
+            let matches = vault::search(&records, &query);
+
+            if matches.is_empty() {
+                let vault_data = vault::load(&vp, &id.signing.secret)?;
+                let cached = vault::search(&vault_data.records, &query);
+                if cached.is_empty() {
+                    eprintln!("❌ No secrets matching '{}' found.", query);
+                    return Ok(());
+                }
+                println!("   (from local cache)\n");
+                copy_to_clipboard(&cached)?;
+            } else {
+                copy_to_clipboard(&matches)?;
             }
         }
+
+        Commands::List { refresh } => {
+            if refresh {
+                println!("📥 Refreshing from the mesh...");
+                let synced = network::sync_from_network(&client, &cli.rpc, &id, &vp).await?;
+                println!("   {} secret(s) synced.\n", synced);
+            }
+
+            let vault_data = vault::load(&vp, &id.signing.secret)?;
+
+            if vault_data.records.is_empty() {
+                println!("📭 Vault is empty. Run 'enigma sync' to pull from the mesh.");
+                return Ok(());
+            }
+
+            for record in &vault_data.records {
+                println!("🔹 {}", style(&record.title).bold().green());
+                if !record.url.is_empty() {
+                    println!("   URL:  {}", style(&record.url).dim());
+                }
+                println!("   User: {}", record.username);
+                println!("   Pass: {}", style("••••••••").dim());
+                if !record.notes.is_empty() {
+                    println!("   Note: {}", style(&record.notes).italic());
+                }
+                println!();
+            }
+
+            println!("📋 {} secret(s) in vault.", vault_data.records.len());
+            if let Some(ts) = vault_data.last_sync {
+                let ago = now_secs().saturating_sub(ts);
+                let human = if ago < 60 { format!("{}s ago", ago) }
+                    else if ago < 3600 { format!("{}m ago", ago / 60) }
+                    else { format!("{}h ago", ago / 3600) };
+                println!("   Last synced: {}", style(human).dim());
+            }
+        }
+
+        Commands::Ui { .. } => unreachable!(), // handled above
     }
 
     Ok(())
 }
 
-async fn ensure_identity_registered(
-    client: &reqwest::Client,
-    rpc: &str,
-    id: &identity::PersistentIdentity,
-) -> Result<()> {
-    let body = json!({ "did": id.did, "encryption_key": hex::encode(&id.encryption.public) });
-    let res = client
-        .post(format!("{}/announce_key", rpc))
-        .json(&body)
-        .send()
-        .await?;
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
 
-    if res.status().is_success() {
-        println!("✅ Identity Announced to Network.");
+fn copy_to_clipboard(matches: &[&SecretRecord]) -> Result<()> {
+    let selected = if matches.len() == 1 {
+        matches[0]
     } else {
-        println!("⚠️  Announcement failed: {}", res.status());
+        let items: Vec<String> = matches.iter().map(|r| {
+            let url_part = if r.url.is_empty() { String::new() } else { format!(" — {}", r.url) };
+            format!("{}{} ({})", r.title, url_part, r.username)
+        }).collect();
+
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Multiple matches — select one")
+            .items(&items)
+            .default(0)
+            .interact()?;
+
+        matches[selection]
+    };
+
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|e| anyhow::anyhow!("Clipboard unavailable: {}", e))?;
+    clipboard.set_text(&selected.password)
+        .map_err(|e| anyhow::anyhow!("Failed to copy: {}", e))?;
+
+    println!("🔹 {}", style(&selected.title).bold().green());
+    if !selected.url.is_empty() {
+        println!("   URL:  {}", selected.url);
     }
+    println!("   User: {}", selected.username);
+    println!("   ✅ Password copied to clipboard.");
+    println!("   ⏱️  Auto-clearing in 30 seconds...");
+
+    let password = selected.password.clone();
+    std::thread::sleep(std::time::Duration::from_secs(30));
+    if let Ok(mut cb) = arboard::Clipboard::new() {
+        if cb.get_text().map(|t| t == password).unwrap_or(false) {
+            let _ = cb.set_text("");
+            println!("   🧹 Clipboard cleared.");
+        }
+    }
+
     Ok(())
 }

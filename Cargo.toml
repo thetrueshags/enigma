@@ -3,10 +3,10 @@ members = ["crates/enigma-core", "crates/enigma-cli"]
 resolver = "2"
 
 [workspace.dependencies]
-# Pointing to the main branch for shared types
-axion-core = { git = "https://github.com/thetrueshags/axion", branch = "main" }
-axion-crypto = { git = "https://github.com/thetrueshags/axion", branch = "main" }
-axion-net = { git = "https://github.com/thetrueshags/axion", branch = "main" }
+# Local path references to Axion L1 crates
+axion-core = { path = "../axion/crates/axion-core" }
+axion-crypto = { path = "../axion/crates/axion-crypto" }
+axion-net = { path = "../axion/crates/axion-net" }
 
 # Cryptography
 aes-gcm = "0.10"
@@ -28,3 +28,5 @@ tokio = { version = "1.36", features = ["full"] }
 console = "0.15"
 dialoguer = "0.11"
 reqwest = { version = "0.11", features = ["json"] }
+arboard = "3.4"
+warp = "0.3"
